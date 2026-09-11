@@ -119,6 +119,10 @@ class Key:
             
         self.inactive_label = self.configopts.get('InactiveLabel', '{}.OFF'.format(self.id))
         self.active_label = self.configopts.get('ActiveLabel', '{}.ON'.format(self.id))
+        self.value_labels = [
+            label.strip() for label in self.configopts.get('ValueLabels', '').split(',') if label.strip()
+        ]
+        self.label_value = 0
 
         self.inactive_label_color = self.configopts.get('InactiveLabelColor', 'white')
         self.active_label_color = self.configopts.get('ActiveLabelColor', 'black')
@@ -136,6 +140,8 @@ class Key:
             # Momentary button: create output (button press) and input (LED state) pins
             self.hal.newpin(self.pin_name('out'), hal.HAL_BIT, hal.HAL_OUT)
             self.hal.newpin(self.pin_name('in'), hal.HAL_BIT, hal.HAL_IN)
+            if self.value_labels:
+                self.hal.newpin(self.pin_name('label-value'), hal.HAL_S32, hal.HAL_IN)
 
             # Optional enable pin to disable the button
             self.hasEnable = self.configopts.getboolean('EnablePin', False)
@@ -162,6 +168,8 @@ class Key:
             self.min_interval = self.configopts.getfloat('MinInterval', 0.1)  # Minimum time between updates
             self.display_label_color = self.configopts.get('DisplayLabelColor', self.active_label_color)
             self.display_background = self.configopts.get('DisplayBackground', self.active_background)
+            self.has_color_state = self.configopts.getboolean('ColorStatePin', False)
+            self.color_state = False
             self.enabled = True
             self.hasEnable = False
             self._last_good_value = None
@@ -170,6 +178,8 @@ class Key:
             # Create HAL input pin for float value
             if self.float_pin:
                 self.hal.newpin(self.pin_name('value'), hal.HAL_FLOAT, hal.HAL_IN)
+            if self.has_color_state:
+                self.hal.newpin(self.pin_name('color-state'), hal.HAL_BIT, hal.HAL_IN)
       
         # Image support
         # InactiveImage: image for released/off state
@@ -281,10 +291,17 @@ class Key:
             else:
                 enable_state = True
 
+            label_value = self.hal[self.pin_name('label-value')] if self.value_labels else 0
+
             # Update if state or enable changed
-            if self.enabled != enable_state or self.state != in_state:
+            if (
+                self.enabled != enable_state
+                or self.state != in_state
+                or self.label_value != label_value
+            ):
                 self.state = in_state
                 self.enabled = enable_state
+                self.label_value = label_value
                 self.update_key_image()
         
         elif self.type == KeyTypes.DISPLAY_FLOAT:
@@ -294,6 +311,10 @@ class Key:
                 value = self.hal[self.pin_name('value')]
             except Exception:
                 value = None
+
+            color_state = self.hal[self.pin_name('color-state')] if self.has_color_state else False
+            color_updated = self.color_state != color_state
+            self.color_state = color_state
  
             def _is_valid(v):
                 """Check if value is valid (not NaN or Inf)"""
@@ -313,7 +334,7 @@ class Key:
  
             # Also update periodically (min_interval) even if value unchanged
             # This ensures display doesn't freeze if value is constant
-            if updated or (now - self._last_update_ts) >= self.min_interval:
+            if updated or color_updated or (now - self._last_update_ts) >= self.min_interval:
                 self._last_update_ts = now              
                 self.state = value
                 self.update_key_image()
@@ -395,6 +416,8 @@ class Key:
         with self.deck:
             # Determine label based on state
             label = self.active_label if self.state else self.inactive_label
+            if self.value_labels and 0 <= self.label_value < len(self.value_labels):
+                label = self.value_labels[self.label_value]
             
             # For float display, format the value
             if self.type == KeyTypes.DISPLAY_FLOAT:
@@ -408,6 +431,11 @@ class Key:
             background = 'black' if self.type == KeyTypes.UNUSED else (
                self.active_background if self.state else self.inactive_background
             )
+            if self.type == KeyTypes.DISPLAY_FLOAT:
+                color = (
+                    self.active_label_color if self.color_state else self.inactive_label_color
+                ) if self.has_color_state else self.display_label_color
+                background = self.display_background
 
             # Try to use configured image first
             img_file = None
