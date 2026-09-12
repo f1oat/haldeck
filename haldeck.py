@@ -123,6 +123,11 @@ class Key:
             label.strip() for label in self.configopts.get('ValueLabels', '').split(',') if label.strip()
         ]
         self.label_value = 0
+        self.base_font_size = self.configopts.getint('FontSize', 14)
+        self.value_label_font_size = self.configopts.getint(
+            'ValueLabelFontSize',
+            self.base_font_size,
+        )
 
         self.inactive_label_color = self.configopts.get('InactiveLabelColor', 'white')
         self.active_label_color = self.configopts.get('ActiveLabelColor', 'black')
@@ -416,8 +421,12 @@ class Key:
         with self.deck:
             # Determine label based on state
             label = self.active_label if self.state else self.inactive_label
+            using_value_label = False
             if self.value_labels and 0 <= self.label_value < len(self.value_labels):
                 label = self.value_labels[self.label_value]
+                using_value_label = True
+
+            fontsize = self.base_font_size
             
             # For float display, format the value
             if self.type == KeyTypes.DISPLAY_FLOAT:
@@ -425,6 +434,8 @@ class Key:
                     label = self.format_str.format(self.state)
                 except:
                     label = "----"  # Show dashes if formatting fails
+            elif using_value_label:
+                fontsize = self.value_label_font_size
 
             # Determine colors based on state
             color = self.active_label_color if self.state else self.inactive_label_color
@@ -460,7 +471,6 @@ class Key:
                 # Optionally draw label on top of image
                 if self.draw_label_on_image:
                     draw = ImageDraw.Draw(image)
-                    fontsize = self.configopts.getint('fontsize', 14)
                     font = ImageFont.truetype(os.path.join(ASSETS_PATH, "Roboto-Regular.ttf"), fontsize)
                     draw.multiline_text(
                         (image.width / 2, image.height / 2),
@@ -472,7 +482,6 @@ class Key:
                 
                 if self.type != KeyTypes.UNUSED:
                     draw = ImageDraw.Draw(image)
-                    fontsize = self.configopts.getint('fontsize', 14)
                     font = ImageFont.truetype(os.path.join(ASSETS_PATH, "Roboto-Regular.ttf"), fontsize)
                     draw.multiline_text(
                         (image.width / 2, image.height / 2),
