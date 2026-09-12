@@ -493,7 +493,13 @@ class Key:
         Update the key image on the physical device
         Renders the image and sends it to the StreamDeck
         """
+        if self.deck is None:
+            return
+
         image = self.render_key_image()
+        if image is None:
+            return
+
         with self.deck:
             self.deck.set_key_image(self.id, image)
 
@@ -506,6 +512,43 @@ deck_ref = None             # Reference to StreamDeck device
 hal_page_select_pin = None  # HAL pin name for page selection
 hal_page_current_pin = None # HAL pin name for page feedback
 press_origin_by_key = {}    # {(deck_id, key_index): page_number} - track where key was pressed
+session_disconnect_event = None
+
+
+def wait_for_visual_deck(retry_interval=1.0):
+    """Block until a visual Stream Deck is connected and can be opened."""
+    while True:
+        try:
+            decks = DeviceManager().enumerate()
+            vprint("HalDeck found {} deck(s).".format(len(decks)))
+
+            for deck in decks:
+                if not deck.is_visual():
+                    continue
+
+                try:
+                    deck.open()
+                    return deck
+                except (OSError, TransportError) as error:
+                    vprint("Waiting to open Stream Deck: {}".format(error))
+        except (OSError, TransportError) as error:
+            vprint("Waiting for Stream Deck: {}".format(error))
+
+        time.sleep(retry_interval)
+
+
+def clear_momentary_outputs():
+    """Reset all momentary output pins to avoid latched commands on disconnect."""
+    for key_list in keys_by_page.values():
+        for key_obj in key_list:
+            key_obj.state = False
+            if key_obj.type == KeyTypes.MOMENTARY:
+                try:
+                    HAL[key_obj.pin_name('out')] = False
+                except Exception:
+                    pass
+
+    press_origin_by_key.clear()
 
 
 def load_splash_image(deck, image_path, background_color='black', key_spacing=(12, 12)):
@@ -679,7 +722,7 @@ def switch_to_page(new_page, force=False):
             for key in keys_by_page[current_page]:
                 key.update_key_image()
 
-def page_monitor():
+def page_monitor(deck, disconnect_event):
     """
     Monitor HAL pin for page change requests
     
@@ -694,8 +737,11 @@ def page_monitor():
     last_page_request = current_page
     keepalive_counter = 0
     
-    while deck_ref and deck_ref.is_open():
+    while not disconnect_event.is_set():
         try:
+            if deck_ref is not deck:
+                break
+
             # Check for page change request via HAL pin
             if hal_page_select_pin:
                 page_request = HAL[hal_page_select_pin]
@@ -711,22 +757,26 @@ def page_monitor():
             keepalive_counter += 1
             if keepalive_counter >= 300:  # 300 * 0.1s = 30 seconds
                 try:
-                    if deck_ref:
-                        with deck_ref:
-                            _ = deck_ref.get_brightness()  # Simple query to keep USB active
-                        vprint("USB keepalive ping")
-                except:
-                    pass  # Ignore errors - not critical
+                    with deck:
+                        _ = deck.get_brightness()  # Simple query to keep USB active
+                    vprint("USB keepalive ping")
+                except (TransportError, OSError):
+                    disconnect_event.set()
+                    break
+                except Exception:
+                    pass  # Ignore non-transport errors - not critical
                 keepalive_counter = 0
             
             # Small sleep to avoid busy loop
             threading.Event().wait(0.1)
             
-        except TransportError:
+        except (TransportError, OSError):
             # Deck was unplugged or connection lost
+            disconnect_event.set()
             break
         except Exception as e:
             vprint("Error in page monitor: {}".format(e))
+            disconnect_event.set()
             break
 
 def key_change_callback(deck, key, state):
@@ -742,7 +792,7 @@ def key_change_callback(deck, key, state):
         key: Key index (0-based)
         state: True for press, False for release
     """
-    global current_page, keys_by_page, press_origin_by_key
+    global current_page, keys_by_page, press_origin_by_key, session_disconnect_event
 
     vprint("Deck {} Key {} = {} (Page {})".format(deck.id(), key, state, current_page), flush=True)
 
@@ -758,9 +808,14 @@ def key_change_callback(deck, key, state):
         target_page = press_origin_by_key.pop(deck_key, current_page)
 
     # Route event to the appropriate key object
-    with deck:
-        if target_page in keys_by_page and key < len(keys_by_page[target_page]):
-            keys_by_page[target_page][key].key_change(state)
+    try:
+        with deck:
+            if target_page in keys_by_page and key < len(keys_by_page[target_page]):
+                keys_by_page[target_page][key].key_change(state)
+    except (TransportError, OSError) as error:
+        vprint("Key callback transport error: {}".format(error))
+        if session_disconnect_event is not None:
+            session_disconnect_event.set()
 
 def handle_key_event(deck, key_index, state):
     """
@@ -827,174 +882,223 @@ if __name__ == "__main__":
     
     vprint("Created HAL pins: haldeck.{} (IN) and haldeck.{} (OUT)".format(
         hal_page_select_pin, hal_page_current_pin))
-        
-    # Enumerate and open StreamDeck devices
-    decks = DeviceManager().enumerate()
-    vprint("HalDeck found {} deck(s).\n".format(len(decks)))
 
-    for index, deck in enumerate(decks):
-        # Skip non-visual devices (e.g., Stream Deck Pedal)
-        if not deck.is_visual():
-            continue
+    # Parse configuration before device discovery so every HAL pin can be
+    # published even when the Stream Deck is not connected.
+    configured_pages = set()      # Normal pages with interactive keys
+    splash_page_configs = {}      # Splash pages with full-screen images
+    configured_key_count = 0
 
-        # Open and reset device
-        deck.open()
-        deck.reset()
-        deck_ref = deck
-
-        vprint("Opened '{}' device (serial number: '{}', fw: '{}')".format(
-            deck.deck_type(), deck.get_serial_number(), deck.get_firmware_version()
-        ))
-
-        # Set brightness
-        bright = configopts.getint('Brightness', 30)
-        vprint("Set brightness to {}".format(bright))
-        deck.set_brightness(bright)
-
-        # Parse configuration to find pages
-        configured_pages = set()      # Normal pages with interactive keys
-        splash_page_configs = {}      # Splash pages with full-screen images
-        
-        for section in config.sections():
-            if section.startswith('page.') and not '.' in section[5:]:
-                # Page-level config: [page.N]
-                try:
-                    page_num = int(section.split('.')[1])
-                    if 1 <= page_num <= MAX_PAGES:
-                        # Check if it's a splash page
-                        if config.has_option(section, 'Type') and config.get(section, 'Type') == 'splash':
-                            splash_image = config.get(section, 'SplashImage', fallback=None)
-                            splash_bg = config.get(section, 'SplashBackground', fallback='black')
-                            if splash_image:
-                                splash_page_configs[page_num] = {
-                                    'image': splash_image,
-                                    'background': splash_bg
-                                }
-                                vprint(f"Found splash page {page_num}: {splash_image}")
-                        else:
-                            configured_pages.add(page_num)
-                except (ValueError, IndexError):
-                    pass
-                    
-            elif section.startswith('page.'):
-                # Key-specific config: [page.N.key.XX]
-                try:
-                    page_num = int(section.split('.')[1])
-                    if 1 <= page_num <= MAX_PAGES:
+    for section in config.sections():
+        if section.startswith('page.') and not '.' in section[5:]:
+            # Page-level config: [page.N]
+            try:
+                page_num = int(section.split('.')[1])
+                if 1 <= page_num <= MAX_PAGES:
+                    # Check if it's a splash page
+                    if config.has_option(section, 'Type') and config.get(section, 'Type') == 'splash':
+                        splash_image = config.get(section, 'SplashImage', fallback=None)
+                        splash_bg = config.get(section, 'SplashBackground', fallback='black')
+                        if splash_image:
+                            splash_page_configs[page_num] = {
+                                'image': splash_image,
+                                'background': splash_bg
+                            }
+                            vprint(f"Found splash page {page_num}: {splash_image}")
+                    else:
                         configured_pages.add(page_num)
-                except (ValueError, IndexError):
-                    pass
-                    
-            elif section.startswith('key.'):
-                # Legacy format: [key.XX] - always page 1
-                configured_pages.add(1)
-        
-        # If no pages configured, assume page 1
-        if not configured_pages and not splash_page_configs:
+            except (ValueError, IndexError):
+                pass
+
+        elif section.startswith('page.'):
+            # Key-specific config: [page.N.key.XX]
+            try:
+                section_parts = section.split('.')
+                page_num = int(section_parts[1])
+                key_num = int(section_parts[3])
+                if 1 <= page_num <= MAX_PAGES:
+                    configured_pages.add(page_num)
+                    configured_key_count = max(configured_key_count, key_num + 1)
+            except (ValueError, IndexError):
+                pass
+
+        elif section.startswith('key.'):
+            # Legacy format: [key.XX] - always page 1
             configured_pages.add(1)
-        
-        vprint("Found configured pages: {}".format(sorted(configured_pages)))
-        vprint("Found splash pages: {}".format(sorted(splash_page_configs.keys())))
-        
-        # Load splash images
-        for page_num, splash_config in splash_page_configs.items():
-            # Load and split image across keys
-            # key_spacing accounts for physical bezels between keys
-            key_images = load_splash_image(
-                deck, 
-                splash_config['image'], 
-                splash_config['background'], 
-                key_spacing=(12, 12)  # Typical bezel width for StreamDeck
-            )
-            if key_images:
-                splash_pages[page_num] = key_images
-                vprint(f"Loaded splash page {page_num} with {len(key_images)} key images")
+            try:
+                key_num = int(section.split('.')[1])
+                configured_key_count = max(configured_key_count, key_num + 1)
+            except (ValueError, IndexError):
+                pass
 
-        # Initialize keys for normal pages
-        for page in sorted(configured_pages):
-            keys_by_page[page] = []
-            
-            # Create Key object for each physical key
-            for key in range(deck.key_count()):
-                key_obj = Key(deckref=deck, halref=HAL, confref=config, id=key, page=page)
-                keys_by_page[page].append(key_obj)
-            
-            # Count and report configured keys
-            configured_keys = sum(1 for k in keys_by_page[page] if k.type != KeyTypes.UNUSED)
-            if configured_keys > 0:
-                vprint("Page {}: {} configured keys".format(page, configured_keys))
-        
-        # Start background update thread
-        def update():
-            """
-            Background thread for polling HAL pins and key states
-            
-            This thread:
-            1. Polls HAL input pins for LED state updates
-            2. Polls physical key states (VM workaround)
-            3. Updates key images when state changes
-            """
-            prev_key_states = {}  # Track previous states for edge detection
-            
-            while deck.is_open():
-                try:
-                    # Skip polling for splash pages (they have no interactive keys)
-                    if current_page not in splash_pages and current_page in keys_by_page:
-                        # Poll HAL pins for each key on current page
-                        for key_obj in keys_by_page[current_page]:
-                            key_obj.state_poll()
-                        
-                        # VM Workaround: Direct key state polling
-                        # In VM environments, USB callbacks can be unreliable
-                        # This directly polls key states as a fallback
+    # If no pages configured, assume page 1
+    if not configured_pages and not splash_page_configs:
+        configured_pages.add(1)
+
+    vprint("Found configured pages: {}".format(sorted(configured_pages)))
+    vprint("Found splash pages: {}".format(sorted(splash_page_configs.keys())))
+
+    # Key construction publishes the configured pins and does not access USB.
+    for page in sorted(configured_pages):
+        keys_by_page[page] = [
+            Key(deckref=None, halref=HAL, confref=config, id=key, page=page)
+            for key in range(configured_key_count)
+        ]
+
+        configured_keys = sum(1 for key in keys_by_page[page] if key.type != KeyTypes.UNUSED)
+        if configured_keys > 0:
+            vprint("Page {}: {} configured keys".format(page, configured_keys))
+
+    # Let LinuxCNC continue; hardware discovery now runs independently.
+    HAL.ready()
+
+    try:
+        while True:
+            disconnect_event = threading.Event()
+            session_disconnect_event = disconnect_event
+
+            try:
+                deck = wait_for_visual_deck()
+                deck_ref = deck
+                splash_pages.clear()
+
+                # Reset the device after wait_for_visual_deck() has opened it.
+                deck.reset()
+
+                vprint("Opened '{}' device (serial number: '{}', fw: '{}')".format(
+                    deck.deck_type(), deck.get_serial_number(), deck.get_firmware_version()
+                ))
+
+                # Set brightness
+                bright = configopts.getint('Brightness', 30)
+                vprint("Set brightness to {}".format(bright))
+                deck.set_brightness(bright)
+
+                # Load splash images
+                for page_num, splash_config in splash_page_configs.items():
+                    # Load and split image across keys
+                    # key_spacing accounts for physical bezels between keys
+                    key_images = load_splash_image(
+                        deck,
+                        splash_config['image'],
+                        splash_config['background'],
+                        key_spacing=(12, 12)  # Typical bezel width for StreamDeck
+                    )
+                    if key_images:
+                        splash_pages[page_num] = key_images
+                        vprint(f"Loaded splash page {page_num} with {len(key_images)} key images")
+
+                # Attach the already-published keys to the connected device.
+                for page in sorted(configured_pages):
+                    for key_obj in keys_by_page[page]:
+                        key_obj.deck = deck
+
+                # Start background update thread
+                def update():
+                    """
+                    Background thread for polling HAL pins and key states
+
+                    This thread:
+                    1. Polls HAL input pins for LED state updates
+                    2. Polls physical key states (VM workaround)
+                    3. Updates key images when state changes
+                    """
+                    prev_key_states = {}  # Track previous states for edge detection
+
+                    while not disconnect_event.is_set():
                         try:
-                            current_key_states = deck.key_states()
-                            for key_id, state in enumerate(current_key_states):
-                                prev_state = prev_key_states.get(key_id, False)
-                                
-                                # Detect state change
-                                if state != prev_state:
-                                    vprint("VM polling detected: Key {} = {}".format(key_id, state))
-                                    
-                                    # Route event through centralized handler
-                                    if current_page in keys_by_page and key_id < len(keys_by_page[current_page]):
-                                        handle_key_event(deck, key_id, state)
-                                    
-                                    prev_key_states[key_id] = state
-                        except:
-                            pass  # Fallback if direct polling not supported
-                    
-                    # Sleep to avoid busy loop
-                    time.sleep(0.01)  # 100 Hz polling rate
-                                
-                except TransportError:
-                    # Device disconnected
-                    break
-        
-        # Start background threads
-        threading.Thread(target=update, daemon=True).start()
-        threading.Thread(target=page_monitor, daemon=True).start()
-        
-        # Register hardware callback for key events
-        deck.set_key_callback(key_change_callback)
-        
-        # Display initial page
-        initial_page = min(keys_by_page.keys()) if keys_by_page else 1
-        current_page = initial_page
-        HAL[hal_page_current_pin] = initial_page
-        switch_to_page(initial_page, force=True)
+                            if deck_ref is not deck:
+                                break
 
-        # Mark HAL component as ready
-        # LinuxCNC will now see this component and its pins
-        HAL.ready()
+                            # Poll key states every cycle so disconnects are detected
+                            # even while splash pages are active.
+                            try:
+                                current_key_states = deck.key_states()
+                            except (TransportError, OSError):
+                                disconnect_event.set()
+                                break
+                            except Exception:
+                                current_key_states = []  # Fallback if direct polling not supported
 
-        # Main loop: just keep running
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            # Clean shutdown on Ctrl+C
-            vprint("Shutting down...")
-            with deck:
-                deck.reset()  # Clear all images
-                deck.close()  # Close connection
+                            # Skip HAL-state updates for splash pages (no interactive keys).
+                            if current_page not in splash_pages and current_page in keys_by_page:
+                                # Poll HAL pins for each key on current page
+                                for key_obj in keys_by_page[current_page]:
+                                    key_obj.state_poll()
+
+                                # VM Workaround: Direct key state polling
+                                # In VM environments, USB callbacks can be unreliable
+                                # This directly polls key states as a fallback
+                                for key_id, state in enumerate(current_key_states):
+                                    prev_state = prev_key_states.get(key_id, False)
+
+                                    # Detect state change
+                                    if state != prev_state:
+                                        vprint("VM polling detected: Key {} = {}".format(key_id, state))
+
+                                        # Route event through centralized handler
+                                        if current_page in keys_by_page and key_id < len(keys_by_page[current_page]):
+                                            handle_key_event(deck, key_id, state)
+
+                                        prev_key_states[key_id] = state
+
+                            # Sleep to avoid busy loop
+                            time.sleep(0.01)  # 100 Hz polling rate
+
+                        except (TransportError, OSError):
+                            # Device disconnected
+                            disconnect_event.set()
+                            break
+                        except Exception as e:
+                            vprint("Error in update thread: {}".format(e))
+                            disconnect_event.set()
+                            break
+
+                # Start background threads
+                threading.Thread(target=update, daemon=True).start()
+                threading.Thread(target=page_monitor, args=(deck, disconnect_event), daemon=True).start()
+
+                # Register hardware callback for key events
+                deck.set_key_callback(key_change_callback)
+
+                # Display initial page
+                initial_page = min(keys_by_page.keys()) if keys_by_page else 1
+                current_page = initial_page
+                HAL[hal_page_current_pin] = initial_page
+                switch_to_page(initial_page, force=True)
+
+                # Wait until this deck session disconnects.
+                while not disconnect_event.wait(0.25):
+                    pass
+
+                vprint("Stream Deck disconnected; waiting for reconnect")
+
+            except (TransportError, OSError) as error:
+                vprint("Deck session interrupted: {}".format(error))
+
+            finally:
+                active_deck = deck_ref
+                session_disconnect_event = None
+                clear_momentary_outputs()
+
+                for key_list in keys_by_page.values():
+                    for key_obj in key_list:
+                        key_obj.deck = None
+
+                deck_ref = None
+
+                if active_deck:
+                    try:
+                        with active_deck:
+                            active_deck.reset()  # Clear all images
+                    except Exception:
+                        pass
+
+                    try:
+                        active_deck.close()  # Close connection
+                    except Exception:
+                        pass
+
+    except KeyboardInterrupt:
+        # Clean shutdown on Ctrl+C
+        vprint("Shutting down...")
